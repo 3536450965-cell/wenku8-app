@@ -93,6 +93,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Package apk
+        id: package
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version: *//p' pubspec.yaml | head -1)
@@ -102,6 +103,7 @@ jobs:
           cp build/app/outputs/flutter-apk/app-release.apk "$out"
           ls -l "$out"
           echo "APK_NAME=$out" >> "$GITHUB_ENV"
+          echo "apk=$out" >> "$GITHUB_OUTPUT"
           sha256sum "$out" | tee "$out.sha256"
 
       - name: Upload apk
@@ -109,6 +111,6 @@ jobs:
         with:
           name: Wenku8-android-apk
           path: |
-            ${{ env.APK_NAME }}
-            ${{ env.APK_NAME }}.sha256
+            ${{ steps.package.outputs.apk }}
+            ${{ steps.package.outputs.apk }}.sha256
           if-no-files-found: error
