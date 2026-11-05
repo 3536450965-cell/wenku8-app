@@ -108,4 +108,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Wenku8-unsigned-ipa
-          path: ${{ steps.package.outputs.ipa }}
+          path: ${{ steps.package.outputs.ipa }}# rebuild trigger 2026-11-05T12:56:43.8637763+08:00
