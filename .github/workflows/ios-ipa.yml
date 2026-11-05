@@ -1,0 +1,111 @@
+name: iOS unsigned ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      strip_app_groups:
+        description: 'Strip the App Groups entitlement (free Apple ID signing)'
+        type: boolean
+        default: true
+      runner:
+        description: 'macOS runner image'
+        type: string
+        default: 'macos-14'
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.9'
+          cache: true
+
+      - name: Toolchain versions
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Fill missing assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets/report assets/reading_previews
+          printf 'placeholder\n' > assets/report/placeholder.txt
+          for name in archive shelf editorial constellation signal score ink festival; do
+            src="assets/reading_art/${name}-117.webp"
+            dst="assets/reading_previews/${name}-117.webp"
+            if [ ! -f "$dst" ]; then
+              if [ -f "$src" ]; then cp "$src" "$dst"; else printf 'placeholder\n' > "$dst"; fi
+            fi
+          done
+          ls -1 assets/reading_previews | head -20
+
+      - name: Fetch book index
+        run: |
+          set -euo pipefail
+          if [ -f data/wenku8_index.json ]; then
+            cp data/wenku8_index.json assets/wenku8_index.json
+          else
+            printf '[]' > assets/wenku8_index.json
+            echo "no committed index; shipping empty index"
+          fi
+          python3 -c "import json;d=json.load(open('assets/wenku8_index.json'));print('index rows',len(d))"
+
+      - name: Strip App Groups entitlements
+        if: ${{ inputs.strip_app_groups }}
+        run: |
+          set -euo pipefail
+          for file in ios/ReadingWidgets/ReadingWidgets.entitlements ios/Runner/ReadingWidgets.entitlements; do
+            if [ -f "$file" ]; then
+              printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0">\n<dict/>\n</plist>\n' > "$file"
+              echo "stripped $file"
+            fi
+          done
+
+      - name: Verify downloads and search
+        run: |
+          flutter test test/wenku8_epub_test.dart
+          flutter test test/wenku8_search_test.dart
+
+      - name: Build unsigned app
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/ios-build"
+          flutter build ios --release --no-codesign --verbose 2>&1 | tee "$RUNNER_TEMP/ios-build/build-ios.log"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-log
+          path: ${{ runner.temp }}/ios-build/build-ios.log
+          if-no-files-found: ignore
+
+      - name: Package IPA
+        id: package
+        run: |
+          set -euo pipefail
+          APP="build/ios/iphoneos/Runner.app"
+          test -d "$APP"
+          version=$(python3 -c "import re;print(re.search(r'^version:\s*([^+\s]+)\+(\d+)',open('pubspec.yaml').read(),re.M).group(1))")
+          build=$(python3 -c "import re;print(re.search(r'^version:\s*([^+\s]+)\+(\d+)',open('pubspec.yaml').read(),re.M).group(2))")
+          name="Wenku8-${version}-${build}-$(date +%Y%m%d)-unsigned.ipa"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry "$name" Payload
+          rm -rf Payload
+          echo "ipa=$name" >> "$GITHUB_OUTPUT"
+          ls -l "$name"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wenku8-unsigned-ipa
+          path: ${{ steps.package.outputs.ipa }}

@@ -1,0 +1,13 @@
+dependency_overrides:
+  flutter:
+    path: ../flutter-sdk/flutter/packages/flutter
+  flutter_test:
+    path: ../flutter-sdk/flutter/packages/flutter_test
+  flutter_driver:
+    path: ../flutter-sdk/flutter/packages/flutter_driver
+  flutter_localizations:
+    path: ../flutter-sdk/flutter/packages/flutter_localizations
+  sky_engine:
+    path: ../flutter-sdk/flutter/bin/cache/pkg/sky_engine
+  integration_test:
+    path: ../flutter-sdk/flutter/packages/integration_test
