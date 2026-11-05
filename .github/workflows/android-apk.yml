@@ -1,0 +1,114 @@
+name: Android apk
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: 'Version name override (empty = pubspec)'
+        required: false
+        default: ''
+      build_number:
+        description: 'Version code override (empty = pubspec)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Build signed-with-debug-key apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.9'
+          channel: stable
+          cache: true
+
+      - name: Toolchain versions
+        run: |
+          flutter --version
+          java -version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/ndk" || true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Fill missing assets
+        run: |
+          set -euo pipefail
+          mkdir -p assets/report assets/reading_previews
+          printf 'placeholder\n' > assets/report/placeholder.txt
+          for name in archive shelf editorial constellation signal score ink festival; do
+            src="assets/reading_art/${name}-117.webp"
+            dst="assets/reading_previews/${name}-117.webp"
+            if [ ! -f "$dst" ]; then
+              if [ -f "$src" ]; then cp "$src" "$dst"; else printf 'placeholder\n' > "$dst"; fi
+            fi
+          done
+
+      - name: Fetch book index
+        run: |
+          set -euo pipefail
+          if [ -f data/wenku8_index.json ]; then
+            cp data/wenku8_index.json assets/wenku8_index.json
+          else
+            printf '[]' > assets/wenku8_index.json
+            echo "no committed index"
+          fi
+          python3 -c "import json;d=json.load(open('assets/wenku8_index.json'));print('index rows',len(d))"
+
+      - name: Verify downloads and search
+        run: flutter test test/wenku8_epub_test.dart test/wenku8_search_test.dart
+
+      - name: Build apk
+        run: |
+          set -euo pipefail
+          args=(--release)
+          if [ -n "${{ inputs.build_name }}" ]; then args+=(--build-name "${{ inputs.build_name }}"); fi
+          if [ -n "${{ inputs.build_number }}" ]; then args+=(--build-number "${{ inputs.build_number }}"); fi
+          flutter build apk "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/build-apk.log"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build-log
+          path: ${{ runner.temp }}/build-apk.log
+          if-no-files-found: warn
+
+      - name: Package apk
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version: *//p' pubspec.yaml | head -1)
+          name=${version%%+*}
+          number=${version##*+}
+          out="Wenku8-${name}-${number}-$(date +%Y%m%d)-android.apk"
+          cp build/app/outputs/flutter-apk/app-release.apk "$out"
+          ls -l "$out"
+          echo "APK_NAME=$out" >> "$GITHUB_ENV"
+          sha256sum "$out" | tee "$out.sha256"
+
+      - name: Upload apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wenku8-android-apk
+          path: |
+            ${{ env.APK_NAME }}
+            ${{ env.APK_NAME }}.sha256
+          if-no-files-found: error
