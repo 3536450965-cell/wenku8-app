@@ -96,7 +96,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          version=$(sed -n 's/^version: *//p' pubspec.yaml | head -1)
+          version=$(sed -n 's/^version: *//p' pubspec.yaml | head -1 | tr -d '\r')
           name=${version%%+*}
           number=${version##*+}
           out="Wenku8-${name}-${number}-$(date +%Y%m%d)-android.apk"
