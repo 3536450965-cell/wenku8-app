@@ -11,6 +11,16 @@ on:
         description: 'Version code override (empty = pubspec)'
         required: false
         default: ''
+      abi:
+        description: 'Which CPU architectures to include'
+        required: false
+        type: choice
+        default: 'arm64'
+        options:
+          - 'arm64'
+          - 'arm'
+          - 'arm+arm64'
+          - 'all'
 
 permissions:
   contents: read
@@ -82,6 +92,13 @@ jobs:
           args=(--release)
           if [ -n "${{ inputs.build_name }}" ]; then args+=(--build-name "${{ inputs.build_name }}"); fi
           if [ -n "${{ inputs.build_number }}" ]; then args+=(--build-number "${{ inputs.build_number }}"); fi
+          case "${{ inputs.abi }}" in
+            arm64) args+=(--target-platform android-arm64);;
+            arm) args+=(--target-platform android-arm);;
+            arm+arm64) args+=(--target-platform android-arm,android-arm64);;
+            *) : ;;
+          esac
+          echo "build args: ${args[*]}"
           flutter build apk "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/build-apk.log"
 
       - name: Upload build log
@@ -99,7 +116,7 @@ jobs:
           version=$(sed -n 's/^version: *//p' pubspec.yaml | head -1 | tr -d '\r')
           name=${version%%+*}
           number=${version##*+}
-          out="Wenku8-${name}-${number}-$(date +%Y%m%d)-android.apk"
+          out="Wenku8-${name}-${number}-$(date +%Y%m%d)-${{ inputs.abi }}-android.apk"
           cp build/app/outputs/flutter-apk/app-release.apk "$out"
           ls -l "$out"
           echo "APK_NAME=$out" >> "$GITHUB_ENV"
