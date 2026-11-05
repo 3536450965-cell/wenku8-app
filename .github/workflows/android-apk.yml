@@ -111,6 +111,6 @@ jobs:
         with:
           name: Wenku8-android-apk
           path: |
-            ${{ steps.package.outputs.apk }}
-            ${{ steps.package.outputs.apk }}.sha256
+            *.apk
+            *.apk.sha256
           if-no-files-found: error
