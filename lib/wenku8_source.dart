@@ -186,6 +186,9 @@ class Wenku8Client {
       _slots.values.fold<int>(0, (sum, slot) => sum + slot.throttles);
 
   /// 选一个最早空出来的域名，占好它的时间槽后再发请求。
+  ///
+  /// 等待被切成 200ms 的小段：取消要能在一瞬间生效，否则用户点「取消」
+  /// 之后还得等十几秒的排期才看到反应。
   Future<_OriginSlot> _claimSlot() async {
     final now = DateTime.now();
     _OriginSlot? pick;
@@ -196,10 +199,30 @@ class Wenku8Client {
     final slot = pick!;
     final target = slot.next.isAfter(now) ? slot.next : now;
     slot.next = target.add(slot.gap);
-    final wait = target.difference(now);
-    if (wait > Duration.zero) await Future<void>.delayed(wait);
+    var left = target.difference(now);
+    const tick = Duration(milliseconds: 200);
+    while (left > Duration.zero) {
+      _throwIfCancelled();
+      final step = left > tick ? tick : left;
+      await Future<void>.delayed(step);
+      left -= step;
+    }
     _current = slot;
     return slot;
+  }
+
+  bool Function()? _cancelCheck;
+
+  /// 直接掐断正在飞行的连接：用户点取消时，等一个 20 秒的请求自己结束
+  /// 就等于「取消没反应」。断开后 `_get` 的 catch 会走重试路径，而重试
+  /// 前会先撞到 `_throwIfCancelled()`，于是几百毫秒内就退出。
+  void abortInflight() {
+    _client?.close(force: true);
+    _client = null;
+  }
+
+  void _throwIfCancelled() {
+    if (_cancelCheck?.call() ?? false) throw Wenku8Exception('已取消。');
   }
 
   /// 一次成功：清失败计数，节奏按倍率往回收（快降快升，不会卡在慢值上）。
@@ -292,6 +315,7 @@ class Wenku8Client {
     var attempt = 0;
     var strikes = 0;
     while (attempt < 5 && strikes < 5) {
+      _throwIfCancelled();
       _OriginSlot? slot;
       try {
         // 每个域名有独立的限流窗口，所以「排队」要按域名排：拿到时间槽的
@@ -627,6 +651,7 @@ class Wenku8Client {
     var cursor = 0;
     Future<void> worker() async {
       while (true) {
+        _throwIfCancelled();
         final index = cursor++;
         if (index >= wanted.length) return;
         if (total > _maxTotalImageBytes) return;
@@ -721,7 +746,23 @@ class Wenku8Client {
     void Function(int done, int total)? onProgress,
     bool Function()? isCancelled,
   }) async {
+    // 取消要能穿透到「等排期」和「抓插图」这些长等待里，所以把判断存在
+    // 客户端上，交给 `_throwIfCancelled()` 在各个等待点检查。
+    _cancelCheck = isCancelled;
+    try {
+      return await _download(book, volumes, onProgress: onProgress);
+    } finally {
+      _cancelCheck = null;
+    }
+  }
+
+  Future<Wenku8Download> _download(
+    Wenku8Book book,
+    List<Wenku8Volume> volumes, {
+    void Function(int done, int total)? onProgress,
+  }) async {
     final category = await _categoryPath(book.id);
+    _throwIfCancelled();
     final all = [for (final volume in volumes) ...volume.chapters];
     final bodies = <String, String>{};
     final images = <String, List<Wenku8Image>>{};
@@ -748,7 +789,7 @@ class Wenku8Client {
     }
 
     Future<void> fetch(Wenku8Chapter entry) async {
-      if (isCancelled?.call() ?? false) throw Wenku8Exception('已取消。');
+      _throwIfCancelled();
       ({String text, List<String> images}) content;
       try {
         content = await _chapterContent(category, book.id, entry.id);
@@ -756,6 +797,8 @@ class Wenku8Client {
         // 整本被下架：继续抓只会攒出一本全是「版权问题」的假书。
         rethrow;
       } on Wenku8Exception {
+        // 用户取消不是「这一章失败」，不要睡 2 秒再重试。
+        _throwIfCancelled();
         // 单章被限流或缺失不该让整本书失败：等一会儿重试一次，仍不行就跳过，
         // 最后在 Wenku8Download.failed 里如实报告。
         await Future<void>.delayed(const Duration(seconds: 2));
@@ -775,6 +818,7 @@ class Wenku8Client {
         // heavy chapter never looks like a stuck download.
         done++;
         onProgress?.call(done, all.length);
+        _throwIfCancelled();
         final shots = await _chapterImages(entry.id, content.images);
         if (shots.isEmpty) {
           skipped.add(entry.title.isEmpty ? entry.id : entry.title);

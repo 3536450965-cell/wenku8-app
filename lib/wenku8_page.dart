@@ -801,11 +801,13 @@ class _Wenku8PageState extends State<Wenku8Page> {
             Align(
               alignment: Alignment.centerRight,
               child: TextButton(
-                onPressed: () {
-                  _downloads.cancel();
-                  setState(() {});
-                },
-                child: const Text('取消下载'),
+                onPressed: _downloads.cancelling
+                    ? null
+                    : () {
+                        _downloads.cancel();
+                        setState(() {});
+                      },
+                child: Text(_downloads.cancelling ? '正在取消…' : '取消下载'),
               ),
             ),
           ],
@@ -1124,10 +1126,26 @@ class Wenku8Downloads extends ChangeNotifier {
     return true;
   }
 
+  /// 取消当前下载并把队列一起清空。
+  ///
+  /// 以前只置一个标志：当前这本被打断后，pump 会接着跑队列里的下一本，
+  /// 用户看到的就是「点了取消没反应」。现在同时清队列，并在界面显示
+  /// 「正在取消…」，等当前请求真的退出再收起进度条。
   void cancel() {
+    if (!pumping) {
+      queue.clear();
+      notifyListeners();
+      return;
+    }
     cancelRequested = true;
+    cancelling = true;
+    queue.clear();
+    _client.abortInflight();
     notifyListeners();
   }
+
+  /// 已经点了取消、还在等正在进行的请求退出。
+  bool cancelling = false;
 
   /// iOS freezes timers while the app is in the background, and a suspended
   /// pump looks exactly like a stopped one. Call this whenever the app comes
@@ -1154,18 +1172,23 @@ class Wenku8Downloads extends ChangeNotifier {
           // One broken book (catalog blocked, network dropped, epub refused)
           // used to escape this loop and leave the rest of the queue frozen:
           // the bar kept rendering while nothing advanced. Report and move on.
-          job.status = '$error';
-          failedBooks[job.book.id] = (book: job.book, count: 0);
+          // 用户主动取消不算失败，不该出现在「下载失败」里。
+          if (!cancelRequested) {
+            job.status = '$error';
+            failedBooks[job.book.id] = (book: job.book, count: 0);
+          }
         }
         queue.remove(job);
         notifyListeners();
       }
     } finally {
       pumping = false;
+      cancelling = false;
       runningTitle = null;
       done = 0;
       total = 0;
       cancelRequested = false;
+      queue.clear();
       notifyListeners();
     }
   }
@@ -1304,7 +1327,6 @@ class Wenku8Downloads extends ChangeNotifier {
     runningTitle = job.book.title;
     done = 0;
     total = job.chapters;
-    cancelRequested = false;
     _sampleAt = null;
     _sampleDone = 0;
     _chaptersPerMinute = 0;

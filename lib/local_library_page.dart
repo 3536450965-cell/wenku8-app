@@ -361,7 +361,9 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      total > 0
+                      downloads.cancelling
+                          ? '正在取消…'
+                          : total > 0
                           ? '正在下载《${downloads.runningTitle ?? ''}》$done / $total 章'
                           : '正在准备《${downloads.runningTitle ?? ''}》…',
                       style: const TextStyle(fontWeight: FontWeight.w600),
@@ -370,8 +372,8 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
                     ),
                   ),
                   TextButton(
-                    onPressed: downloads.cancel,
-                    child: const Text('取消'),
+                    onPressed: downloads.cancelling ? null : downloads.cancel,
+                    child: Text(downloads.cancelling ? '取消中…' : '取消'),
                   ),
                 ],
               ),
