@@ -1,0 +1,5 @@
+# 轻小说文库中转（Cloudflare Worker）——给 App 的「中转加速」用。
+# 一键部署：https://deploy.workers.cloudflare.com/?url=https://github.com/3536450965-cell/wenku8-app
+name = "wenku8-relay"
+main = "relay/worker.js"
+compatibility_date = "2025-01-01"

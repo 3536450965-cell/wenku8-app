@@ -342,41 +342,30 @@ class Wenku8Client {
     for (final origin in _origins) {
       final label = origin.replaceFirst('https://www.', '');
       final samples = <int>[];
-      var failures = 0;
+      final problems = <String>[];
       for (var i = 0; i < 2; i++) {
         final watch = Stopwatch()..start();
-        HttpClient? client;
         try {
-          client = HttpClient()
-            ..connectionTimeout = _connectTimeout
-            ..autoUncompress = false
-            ..userAgent = userAgent;
-          final uri = Uri.parse(
-            '$origin/book/3330.htm?t=${DateTime.now().microsecondsSinceEpoch}',
-          );
+          // 必须复用真正的请求路径：站点在 Cloudflare 后面，少几个
+          // sec-fetch-* 头就会被判成机器人直接 403。上一版这里自己 new 了一个
+          // 裸客户端，结果下载跑得飞快、测速却报「连不上」，把用户看懵了。
+          final client = await _http();
+          final uri = Uri.parse('$origin/book/3330.htm');
           final request = await client.getUrl(uri);
-          request.headers.set(HttpHeaders.userAgentHeader, userAgent);
-          request.headers.set(HttpHeaders.refererHeader, '$origin/');
-          request.headers.set(
-            HttpHeaders.acceptHeader,
-            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          );
-          request.headers.set(HttpHeaders.acceptEncodingHeader, 'gzip, deflate');
+          _applyPageHeaders(request, origin);
           final response = await request.close().timeout(timeout);
           await response.drain<void>().timeout(timeout);
           if (response.statusCode == 200) {
             samples.add(watch.elapsedMilliseconds);
           } else {
-            failures++;
+            problems.add('HTTP ${response.statusCode}');
           }
-        } catch (_) {
-          failures++;
-        } finally {
-          client?.close(force: true);
+        } catch (error) {
+          problems.add(_reason(error));
         }
       }
       if (samples.isEmpty) {
-        lines.add('$label  连不上（2 次都失败）');
+        lines.add('$label  连不上（${problems.join(' / ')}）');
         continue;
       }
       final average = samples.reduce((a, b) => a + b) / samples.length;
@@ -384,7 +373,7 @@ class Wenku8Client {
       totalRate += rate;
       lines.add(
         '$label  ${average.round()} ms'
-        '${failures > 0 ? '（$failures 次失败）' : ''}'
+        '${problems.isEmpty ? '' : '（${problems.join(' / ')}）'}'
         '  约 ${(rate * 60).round()} 章/分',
       );
     }
@@ -392,10 +381,35 @@ class Wenku8Client {
     lines.add('合计约 ${(totalRate * 60).round()} 章/分（单章 1 个请求）');
     lines.add(
       totalRate * 60 < 10
-          ? '结论：这条线路被限得很紧，换网络（比如手机流量）通常会快很多。'
+          ? '结论：两个域名都不通或被限得很死。先看上面的具体原因：'
+                'HTTP 403/429 是站点侧的限流/拦截，作业超时才是你这边网络的问题。'
           : '结论：当前线路可用，慢的话多半是站点限流而不是你的网络。',
     );
     return lines.join('\n');
+  }
+
+  /// 给普通页面请求加上「看起来像浏览器」的那一组头。
+  ///
+  /// 抽出来是因为测速（speedTest）必须和真实抓取走同一套头，否则测出来的
+  /// 不是用户实际会遇到的情况。
+  void _applyPageHeaders(HttpClientRequest request, String origin) {
+    request.headers.set(HttpHeaders.userAgentHeader, userAgent);
+    request.headers.set(HttpHeaders.refererHeader, '$origin/');
+    request.headers.set(
+      HttpHeaders.acceptHeader,
+      'text/html,application/xhtml+xml,application/xml;q=0.9,'
+      'image/avif,image/webp,*/*;q=0.8',
+    );
+    request.headers.set(
+      HttpHeaders.acceptLanguageHeader,
+      'zh-CN,zh;q=0.9,en;q=0.8',
+    );
+    request.headers.set(HttpHeaders.acceptEncodingHeader, 'gzip, deflate');
+    request.headers.set('upgrade-insecure-requests', '1');
+    request.headers.set('sec-fetch-dest', 'document');
+    request.headers.set('sec-fetch-mode', 'navigate');
+    request.headers.set('sec-fetch-site', 'same-origin');
+    request.headers.set('sec-fetch-user', '?1');
   }
 
   static String? parseId(String input) {
@@ -448,23 +462,7 @@ class Wenku8Client {
         // The site sits behind Cloudflare and rejects requests that do not look
         // like a browser; an explicit `accept-encoding` is part of that, so the
         // body is inflated here instead of by dart:io.
-        request.headers.set(HttpHeaders.userAgentHeader, userAgent);
-        request.headers.set(HttpHeaders.refererHeader, '$origin/');
-        request.headers.set(
-          HttpHeaders.acceptHeader,
-          'text/html,application/xhtml+xml,application/xml;q=0.9,'
-          'image/avif,image/webp,*/*;q=0.8',
-        );
-        request.headers.set(
-          HttpHeaders.acceptLanguageHeader,
-          'zh-CN,zh;q=0.9,en;q=0.8',
-        );
-        request.headers.set(HttpHeaders.acceptEncodingHeader, 'gzip, deflate');
-        request.headers.set('upgrade-insecure-requests', '1');
-        request.headers.set('sec-fetch-dest', 'document');
-        request.headers.set('sec-fetch-mode', 'navigate');
-        request.headers.set('sec-fetch-site', 'same-origin');
-        request.headers.set('sec-fetch-user', '?1');
+        _applyPageHeaders(request, origin);
         final startedAt = DateTime.now();
         final response = await request.close().timeout(timeout);
         if (response.statusCode == 429 || response.statusCode == 503) {
