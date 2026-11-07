@@ -179,26 +179,6 @@ class Wenku8Client {
 
   _OriginSlot? _current;
 
-  /// 可选的中转地址（用户自己部署的 Cloudflare Worker / 小服务器）。
-  ///
-  /// 文库按 IP 限流，直连的上限就是「每域名 10 秒 5 个请求」；挂一层中转后，
-  /// 限流落在中转那边，而且中转可以缓存已抓过的章节，同一本书第二次几乎瞬回。
-  /// 留空就是直连，行为与之前完全一致。
-  static String? _proxy;
-
-  static String? get proxy => _proxy;
-
-  static set proxy(String? value) {
-    final trimmed = value?.trim();
-    _proxy = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
-  }
-
-  static String _proxyUrl(String target) {
-    final base = _proxy!;
-    final separator = base.contains('?') ? '&' : '?';
-    return '$base${separator}u=${Uri.encodeComponent(target)}';
-  }
-
   /// 当前实际在用的域名（界面显示用）。
   String get activeOrigin =>
       _current?.origin.replaceFirst('https://www.', '') ?? '—';
@@ -332,66 +312,9 @@ class Wenku8Client {
   HttpClient? _client;
   String? _origin;
 
-  /// 在用户自己的网络里量两个镜像的往返耗时，给出可以照着解释的结论。
-  ///
-  /// 开发机上的数字跟用户手机上的网络差很远，所以把这个「尺子」做进 App，
-  /// 用户点一下就能看到哪个域名快、预计每分钟多少章。
-  Future<String> speedTest() async {
-    final lines = <String>[];
-    var totalRate = 0.0;
-    for (final origin in _origins) {
-      final label = origin.replaceFirst('https://www.', '');
-      final samples = <int>[];
-      final problems = <String>[];
-      for (var i = 0; i < 2; i++) {
-        final watch = Stopwatch()..start();
-        try {
-          // 必须复用真正的请求路径：站点在 Cloudflare 后面，少几个
-          // sec-fetch-* 头就会被判成机器人直接 403。上一版这里自己 new 了一个
-          // 裸客户端，结果下载跑得飞快、测速却报「连不上」，把用户看懵了。
-          final client = await _http();
-          final uri = Uri.parse('$origin/book/3330.htm');
-          final request = await client.getUrl(uri);
-          _applyPageHeaders(request, origin);
-          final response = await request.close().timeout(timeout);
-          await response.drain<void>().timeout(timeout);
-          if (response.statusCode == 200) {
-            samples.add(watch.elapsedMilliseconds);
-          } else {
-            problems.add('HTTP ${response.statusCode}');
-          }
-        } catch (error) {
-          problems.add(_reason(error));
-        }
-      }
-      if (samples.isEmpty) {
-        lines.add('$label  连不上（${problems.join(' / ')}）');
-        continue;
-      }
-      final average = samples.reduce((a, b) => a + b) / samples.length;
-      final rate = 1000 / (average < 900 ? 900 : average);
-      totalRate += rate;
-      lines.add(
-        '$label  ${average.round()} ms'
-        '${problems.isEmpty ? '' : '（${problems.join(' / ')}）'}'
-        '  约 ${(rate * 60).round()} 章/分',
-      );
-    }
-    lines.add('');
-    lines.add('合计约 ${(totalRate * 60).round()} 章/分（单章 1 个请求）');
-    lines.add(
-      totalRate * 60 < 10
-          ? '结论：两个域名都不通或被限得很死。先看上面的具体原因：'
-                'HTTP 403/429 是站点侧的限流/拦截，作业超时才是你这边网络的问题。'
-          : '结论：当前线路可用，慢的话多半是站点限流而不是你的网络。',
-    );
-    return lines.join('\n');
-  }
-
   /// 给普通页面请求加上「看起来像浏览器」的那一组头。
   ///
-  /// 抽出来是因为测速（speedTest）必须和真实抓取走同一套头，否则测出来的
-  /// 不是用户实际会遇到的情况。
+  /// 站点在 Cloudflare 后面，缺了这些头会直接 403。
   void _applyPageHeaders(HttpClientRequest request, String origin) {
     request.headers.set(HttpHeaders.userAgentHeader, userAgent);
     request.headers.set(HttpHeaders.refererHeader, '$origin/');
@@ -446,18 +369,13 @@ class Wenku8Client {
     var strikes = 0;
     while (attempt < 5 && strikes < 5) {
       _throwIfCancelled();
-      _OriginSlot? slot;
+      // 每个域名有独立的限流窗口，所以「排队」要按域名排：拿到时间槽的
+      // 那个域名才是这次真正要用的。
+      final slot = await _claimSlot();
       try {
-        // 每个域名有独立的限流窗口，所以「排队」要按域名排：拿到时间槽的
-        // 那个域名才是这次真正要用的。
-        // 配了中转（Cloudflare Worker）时，限流在那一侧，本机不必排队：
-        // 直接把请求丢过去，靠 Worker 的并发与缓存拿到速度。
-        slot = _proxy == null ? await _claimSlot() : null;
-        final origin = slot?.origin ?? _origins.first;
+        final origin = slot.origin;
         final client = await _http();
-        final target = _proxy == null
-            ? '$origin$path'
-            : _proxyUrl('$origin$path');
+        final target = '$origin$path';
         final request = await client.getUrl(Uri.parse(target));
         // The site sits behind Cloudflare and rejects requests that do not look
         // like a browser; an explicit `accept-encoding` is part of that, so the
@@ -473,7 +391,7 @@ class Wenku8Client {
                 response.headers.value(HttpHeaders.retryAfterHeader) ?? '',
               ) ??
               0;
-          if (slot != null) _throttle(slot, retryAfter * 1000);
+          _throttle(slot, retryAfter * 1000);
           strikes++;
           continue;
         }
@@ -484,7 +402,7 @@ class Wenku8Client {
             .fold<BytesBuilder>(BytesBuilder(copy: false), (b, c) => b..add(c))
             .timeout(timeout);
         _origin = origin;
-        if (slot != null) _praise(slot, DateTime.now().difference(startedAt));
+        _praise(slot, DateTime.now().difference(startedAt));
         return _decode(
           _inflate(
             bytes.takeBytes(),
@@ -497,7 +415,7 @@ class Wenku8Client {
         _client = null;
         if (error is Wenku8Exception) rethrow;
         attempt++;
-        if (slot != null) _fail(slot);
+        _fail(slot);
       }
     }
     if (strikes >= 5) {
@@ -835,8 +753,7 @@ class Wenku8Client {
         await _waitImageSlot();
         final client = await _http();
         final origin = _origin ?? _origins.first;
-        // 图片同样可以走中转：Worker 缓存住插图后，重下同一本书几乎不耗流量。
-        final target = _proxy == null ? url : _proxyUrl(url);
+        final target = url;
         final request = await client.getUrl(Uri.parse(target));
         request.headers.set(HttpHeaders.userAgentHeader, userAgent);
         request.headers.set(HttpHeaders.refererHeader, '$origin/');

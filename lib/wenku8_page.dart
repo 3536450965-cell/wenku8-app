@@ -4,10 +4,10 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_ui.dart';
 import 'catalog.dart';
+import 'custom_source_page.dart';
 import 'library_state.dart';
 import 'local_books.dart';
 import 'wenku8_index.dart';
@@ -660,16 +660,11 @@ class _Wenku8PageState extends State<Wenku8Page> {
           ),
           GlassMenuItem(
             order: 4,
-            label: '网络测速',
-            onPressed: () => Navigator.pop(menu, 'speed'),
+            label: '自定义书源',
+            onPressed: () => Navigator.pop(menu, 'custom'),
           ),
           GlassMenuItem(
             order: 5,
-            label: '中转加速',
-            onPressed: () => Navigator.pop(menu, 'proxy'),
-          ),
-          GlassMenuItem(
-            order: 6,
             label: '关于书源',
             onPressed: () => Navigator.pop(menu, 'about'),
           ),
@@ -686,98 +681,11 @@ class _Wenku8PageState extends State<Wenku8Page> {
         await _probeNewBooks();
       case 'clean':
         await _cleanTemporaryFiles();
-      case 'speed':
-        await _runSpeedTest();
-      case 'proxy':
-        await _editProxy();
+      case 'custom':
+        await openCustomSource(context, widget.books, state: widget.state);
       case 'about':
         await _showAbout();
     }
-  }
-
-  /// 中转地址：填了就走 Worker，留空即直连。
-  ///
-  /// 只在用户自己的设备上生效（存在 SharedPreferences 里），不写进任何仓库，
-  /// 也不随包分发——它本质上是「你自己找的一条更快的路」。
-  Future<void> _editProxy() async {
-    final controller = TextEditingController(
-      text: Wenku8Client.proxy ?? '',
-    );
-    final saved = await showDialog<String>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('中转加速'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text(
-              '填入你自己部署的中转地址（例如 Cloudflare Worker），'
-              '下载会走它，命中缓存时几乎瞬回。留空即直连。',
-              style: TextStyle(fontSize: 13, height: 1.5),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: controller,
-              decoration: const InputDecoration(
-                hintText: 'https://wenku8.xxx.workers.dev',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
-              keyboardType: TextInputType.url,
-              autocorrect: false,
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, ''),
-            child: const Text('清除'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(context, controller.text.trim()),
-            child: const Text('保存'),
-          ),
-        ],
-      ),
-    );
-    if (!mounted || saved == null) return;
-    Wenku8Client.proxy = saved;
-    final preferences = await SharedPreferences.getInstance();
-    await preferences.setString('wenku8_proxy', saved);
-    _hint = saved.isEmpty ? '已改回直连' : '已启用中转：$saved';
-    if (mounted) setState(() {});
-  }
-
-  /// 在用户自己的网络里量一遍两个镜像的往返与吞吐，把结果直接显示出来。
-  /// 我这边的测速代表不了任何人的线路，所以把尺子交给用户。
-  Future<void> _runSpeedTest() async {
-    final messenger = ScaffoldMessenger.maybeOf(context);
-    messenger?.showSnackBar(
-      const SnackBar(content: Text('正在测速，大约 15 秒…')),
-    );
-    final report = await _client.speedTest();
-    if (!mounted) return;
-    await showDialog<void>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('网络测速'),
-        content: SelectableText(
-          report,
-          style: const TextStyle(fontSize: 13, height: 1.5),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('好'),
-          ),
-        ],
-      ),
-    );
   }
 
   Future<void> _showAbout() async {
@@ -795,8 +703,7 @@ class _Wenku8PageState extends State<Wenku8Page> {
         content: Text(
           '轻小说文库（wenku8）· 免注册阅读\n'
           '镜像：www.wenku8.cc / www.wenku8.net\n'
-          '内置书目索引：$rows 本\n'
-          'App 版本 0.5.10 (2281)',
+          '内置书目索引：$rows 本',
           style: const TextStyle(height: 1.7),
         ),
         actions: [
