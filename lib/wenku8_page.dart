@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_ui.dart';
 import 'catalog.dart';
@@ -659,6 +660,16 @@ class _Wenku8PageState extends State<Wenku8Page> {
           ),
           GlassMenuItem(
             order: 4,
+            label: '网络测速',
+            onPressed: () => Navigator.pop(menu, 'speed'),
+          ),
+          GlassMenuItem(
+            order: 5,
+            label: '中转加速',
+            onPressed: () => Navigator.pop(menu, 'proxy'),
+          ),
+          GlassMenuItem(
+            order: 6,
             label: '关于书源',
             onPressed: () => Navigator.pop(menu, 'about'),
           ),
@@ -675,9 +686,98 @@ class _Wenku8PageState extends State<Wenku8Page> {
         await _probeNewBooks();
       case 'clean':
         await _cleanTemporaryFiles();
+      case 'speed':
+        await _runSpeedTest();
+      case 'proxy':
+        await _editProxy();
       case 'about':
         await _showAbout();
     }
+  }
+
+  /// 中转地址：填了就走 Worker，留空即直连。
+  ///
+  /// 只在用户自己的设备上生效（存在 SharedPreferences 里），不写进任何仓库，
+  /// 也不随包分发——它本质上是「你自己找的一条更快的路」。
+  Future<void> _editProxy() async {
+    final controller = TextEditingController(
+      text: Wenku8Client.proxy ?? '',
+    );
+    final saved = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('中转加速'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              '填入你自己部署的中转地址（例如 Cloudflare Worker），'
+              '下载会走它，命中缓存时几乎瞬回。留空即直连。',
+              style: TextStyle(fontSize: 13, height: 1.5),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                hintText: 'https://wenku8.xxx.workers.dev',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, ''),
+            child: const Text('清除'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(context, controller.text.trim()),
+            child: const Text('保存'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted || saved == null) return;
+    Wenku8Client.proxy = saved;
+    final preferences = await SharedPreferences.getInstance();
+    await preferences.setString('wenku8_proxy', saved);
+    _hint = saved.isEmpty ? '已改回直连' : '已启用中转：$saved';
+    if (mounted) setState(() {});
+  }
+
+  /// 在用户自己的网络里量一遍两个镜像的往返与吞吐，把结果直接显示出来。
+  /// 我这边的测速代表不了任何人的线路，所以把尺子交给用户。
+  Future<void> _runSpeedTest() async {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger?.showSnackBar(
+      const SnackBar(content: Text('正在测速，大约 15 秒…')),
+    );
+    final report = await _client.speedTest();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('网络测速'),
+        content: SelectableText(
+          report,
+          style: const TextStyle(fontSize: 13, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('好'),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _showAbout() async {
@@ -1121,6 +1221,7 @@ class Wenku8Downloads extends ChangeNotifier {
     // imported fine and the second one kept re-downloading behind the panel.
     if (queue.any((other) => other.book.id == job.book.id)) return false;
     queue.add(job);
+    failureMessage = null;
     notifyListeners();
     unawaited(_pump());
     return true;
@@ -1146,6 +1247,17 @@ class Wenku8Downloads extends ChangeNotifier {
 
   /// 已经点了取消、还在等正在进行的请求退出。
   bool cancelling = false;
+
+  /// 最近一次失败的原因（含书名），供书架那行提示直接显示。
+  ///
+  /// 之前失败只记进 `failedBooks`，而那份列表只在文库页可见；用户停在书架时
+  /// 只看到进度条消失，等于「取消下载」而没有「这本书下架了」这句话。
+  String? failureMessage;
+
+  void clearFailure() {
+    failureMessage = null;
+    notifyListeners();
+  }
 
   /// iOS freezes timers while the app is in the background, and a suspended
   /// pump looks exactly like a stopped one. Call this whenever the app comes
@@ -1176,6 +1288,10 @@ class Wenku8Downloads extends ChangeNotifier {
           if (!cancelRequested) {
             job.status = '$error';
             failedBooks[job.book.id] = (book: job.book, count: 0);
+            final reason = error is Wenku8Exception
+                ? error.message
+                : '$error';
+            failureMessage = '《${job.book.title}》$reason';
           }
         }
         queue.remove(job);

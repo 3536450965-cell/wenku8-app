@@ -155,7 +155,7 @@ class Wenku8Client {
   ];
 
   final Duration timeout;
-  static const int _downloadWorkers = 3;
+  static const int _downloadWorkers = 4;
   static const int _imageWorkers = 3;
   static const Duration _imageTimeout = Duration(seconds: 12);
 
@@ -163,19 +163,41 @@ class Wenku8Client {
   /// 放弃等于把整本书拖死，6 秒内连不上就当这个域名暂时不可用。
   static const Duration _connectTimeout = Duration(seconds: 6);
 
-  /// 站点按 **每个域名** 分窗口限流：同一个域名大约每 2 秒才放行一个章节
-  /// 请求，超出就整段 429（`retry-after` 8~10 秒）。`.cc` 与 `.net` 是两套
-  /// 独立配额，所以节奏按域名各记一份；同时记每个域名的往返耗时与连续失败，
-  /// 慢的、连不上的自动降权——少这一步，一半请求会死在超时上。
-  static const Duration _gapFloor = Duration(milliseconds: 900);
-  static const Duration _gapCeiling = Duration(milliseconds: 12000);
+  /// 站点按 **每个域名** 分窗口限流，但两条连接同时打同一域名通常还能过
+  /// （实测 .cc 并行 8 个请求 307ms 全通），所以每个域名同时放 2 个在飞请求，
+  /// 槽位间隔按并发数摊薄：2 并发 + 900ms 间隔 ≈ 每域名 2.2 个/秒。
+  /// 真被 429 就只把这个域名的间隔翻倍，不拖累另一个域名。
+  static const Duration _gapFloor = Duration(milliseconds: 500);
+  static const Duration _gapCeiling = Duration(milliseconds: 6000);
   static const Duration _quarantine = Duration(seconds: 40);
+
+  
 
   final Map<String, _OriginSlot> _slots = {
     for (final origin in _origins) origin: _OriginSlot(origin),
   };
 
   _OriginSlot? _current;
+
+  /// 可选的中转地址（用户自己部署的 Cloudflare Worker / 小服务器）。
+  ///
+  /// 文库按 IP 限流，直连的上限就是「每域名 10 秒 5 个请求」；挂一层中转后，
+  /// 限流落在中转那边，而且中转可以缓存已抓过的章节，同一本书第二次几乎瞬回。
+  /// 留空就是直连，行为与之前完全一致。
+  static String? _proxy;
+
+  static String? get proxy => _proxy;
+
+  static set proxy(String? value) {
+    final trimmed = value?.trim();
+    _proxy = (trimmed == null || trimmed.isEmpty) ? null : trimmed;
+  }
+
+  static String _proxyUrl(String target) {
+    final base = _proxy!;
+    final separator = base.contains('?') ? '&' : '?';
+    return '$base${separator}u=${Uri.encodeComponent(target)}';
+  }
 
   /// 当前实际在用的域名（界面显示用）。
   String get activeOrigin =>
@@ -185,20 +207,34 @@ class Wenku8Client {
   int get throttleCount =>
       _slots.values.fold<int>(0, (sum, slot) => sum + slot.throttles);
 
-  /// 选一个最早空出来的域名，占好它的时间槽后再发请求。
+  /// 选一个最早能开工的域名，占好它的时间槽后再发请求。
+  ///
+  /// 评分是「能开工的时间 + 该域名最近往返耗时的 1.5 倍」：两个域名都空着
+  /// 时，慢的那个自然排到后面，不会因为它先空出来就把一半请求塞给它。
   ///
   /// 等待被切成 200ms 的小段：取消要能在一瞬间生效，否则用户点「取消」
   /// 之后还得等十几秒的排期才看到反应。
   Future<_OriginSlot> _claimSlot() async {
     final now = DateTime.now();
     _OriginSlot? pick;
+    DateTime? best;
     for (final origin in _origins) {
       final slot = _slots[origin]!;
-      if (pick == null || slot.next.isBefore(pick.next)) pick = slot;
+      final start = slot.next.isAfter(now) ? slot.next : now;
+      final latency = Duration(milliseconds: (slot.ema * 1.5).round());
+      final score = start.add(latency);
+      if (pick == null || best == null || score.isBefore(best)) {
+        pick = slot;
+        best = score;
+      }
     }
     final slot = pick!;
     final target = slot.next.isAfter(now) ? slot.next : now;
-    slot.next = target.add(slot.gap);
+    // 间隔按并发数摊薄：并发 2 时每 900ms 的槽位实际能发 2 个。
+    final step = Duration(
+      milliseconds: (slot.gap.inMilliseconds / slot.concurrency).round(),
+    );
+    slot.next = target.add(step);
     var left = target.difference(now);
     const tick = Duration(milliseconds: 200);
     while (left > Duration.zero) {
@@ -236,11 +272,21 @@ class Wenku8Client {
       milliseconds: (slot.gap.inMilliseconds * 0.82).round(),
     );
     slot.gap = faster < _gapFloor ? _gapFloor : faster;
+    slot.streak++;
+    // 连续成功 6 次就把并发往上加一档（最多 3）：站点其实能吃几个并发，
+    // 一直被我们按 1 个在发，白白浪费配额。
+    if (slot.streak >= 6 && slot.concurrency < 3) {
+      slot.concurrency++;
+      slot.streak = 0;
+    }
   }
 
-  /// 429：只惩罚这个域名（按 `retry-after` 整段冷却 + 间隔翻倍），不动别的域名。
+  /// 429：只惩罚这个域名（按 `retry-after` 整段冷却 + 间隔翻倍 + 并发退回 1），
+  /// 不动别的域名——之前把惩罚加到全局，一次限流整本书都变慢。
   void _throttle(_OriginSlot slot, int milliseconds) {
     slot.throttles++;
+    slot.streak = 0;
+    slot.concurrency = 1;
     final until = DateTime.now().add(
       Duration(milliseconds: milliseconds.clamp(3000, 20000)),
     );
@@ -251,8 +297,12 @@ class Wenku8Client {
   }
 
   /// 网络错误/超时：连续失败就先把这个域名隔离一段时间，别继续往死域名上撞。
+  /// 顺带把它的延迟估值抬高，选域名时自然会让另一个先上。
   void _fail(_OriginSlot slot) {
     slot.failures++;
+    slot.streak = 0;
+    slot.concurrency = 1;
+    slot.ema = slot.ema < 1500 ? 1500 : slot.ema * 1.5;
     final slower = Duration(
       milliseconds: (slot.gap.inMilliseconds * 1.6).round(),
     );
@@ -281,6 +331,72 @@ class Wenku8Client {
   final Map<String, String> _categories = {};
   HttpClient? _client;
   String? _origin;
+
+  /// 在用户自己的网络里量两个镜像的往返耗时，给出可以照着解释的结论。
+  ///
+  /// 开发机上的数字跟用户手机上的网络差很远，所以把这个「尺子」做进 App，
+  /// 用户点一下就能看到哪个域名快、预计每分钟多少章。
+  Future<String> speedTest() async {
+    final lines = <String>[];
+    var totalRate = 0.0;
+    for (final origin in _origins) {
+      final label = origin.replaceFirst('https://www.', '');
+      final samples = <int>[];
+      var failures = 0;
+      for (var i = 0; i < 2; i++) {
+        final watch = Stopwatch()..start();
+        HttpClient? client;
+        try {
+          client = HttpClient()
+            ..connectionTimeout = _connectTimeout
+            ..autoUncompress = false
+            ..userAgent = userAgent;
+          final uri = Uri.parse(
+            '$origin/book/3330.htm?t=${DateTime.now().microsecondsSinceEpoch}',
+          );
+          final request = await client.getUrl(uri);
+          request.headers.set(HttpHeaders.userAgentHeader, userAgent);
+          request.headers.set(HttpHeaders.refererHeader, '$origin/');
+          request.headers.set(
+            HttpHeaders.acceptHeader,
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          );
+          request.headers.set(HttpHeaders.acceptEncodingHeader, 'gzip, deflate');
+          final response = await request.close().timeout(timeout);
+          await response.drain<void>().timeout(timeout);
+          if (response.statusCode == 200) {
+            samples.add(watch.elapsedMilliseconds);
+          } else {
+            failures++;
+          }
+        } catch (_) {
+          failures++;
+        } finally {
+          client?.close(force: true);
+        }
+      }
+      if (samples.isEmpty) {
+        lines.add('$label  连不上（2 次都失败）');
+        continue;
+      }
+      final average = samples.reduce((a, b) => a + b) / samples.length;
+      final rate = 1000 / (average < 900 ? 900 : average);
+      totalRate += rate;
+      lines.add(
+        '$label  ${average.round()} ms'
+        '${failures > 0 ? '（$failures 次失败）' : ''}'
+        '  约 ${(rate * 60).round()} 章/分',
+      );
+    }
+    lines.add('');
+    lines.add('合计约 ${(totalRate * 60).round()} 章/分（单章 1 个请求）');
+    lines.add(
+      totalRate * 60 < 10
+          ? '结论：这条线路被限得很紧，换网络（比如手机流量）通常会快很多。'
+          : '结论：当前线路可用，慢的话多半是站点限流而不是你的网络。',
+    );
+    return lines.join('\n');
+  }
 
   static String? parseId(String input) {
     final text = input.trim();
@@ -320,10 +436,15 @@ class Wenku8Client {
       try {
         // 每个域名有独立的限流窗口，所以「排队」要按域名排：拿到时间槽的
         // 那个域名才是这次真正要用的。
-        slot = await _claimSlot();
-        final origin = slot.origin;
+        // 配了中转（Cloudflare Worker）时，限流在那一侧，本机不必排队：
+        // 直接把请求丢过去，靠 Worker 的并发与缓存拿到速度。
+        slot = _proxy == null ? await _claimSlot() : null;
+        final origin = slot?.origin ?? _origins.first;
         final client = await _http();
-        final request = await client.getUrl(Uri.parse('$origin$path'));
+        final target = _proxy == null
+            ? '$origin$path'
+            : _proxyUrl('$origin$path');
+        final request = await client.getUrl(Uri.parse(target));
         // The site sits behind Cloudflare and rejects requests that do not look
         // like a browser; an explicit `accept-encoding` is part of that, so the
         // body is inflated here instead of by dart:io.
@@ -385,6 +506,26 @@ class Wenku8Client {
       throw Wenku8Exception('文库正在限流，请稍后再试（$path）');
     }
     throw Wenku8Exception('连接文库失败：${_reason(lastError)}');
+  }
+
+  /// 识别「整本已下架」的提示页，命中就返回要展示给用户的原因，否则 null。
+  ///
+  /// 站点换过几次措辞，最早是「因版权问题，文库不再提供该小说的阅读」，
+  /// 后来又出现「本书已下架」「已停止更新」。判定必须同时满足「文本很短」——
+  /// 真正的章节正文不会只有一两句话——否则正文里偶尔提到「下架」会被误判成
+  /// 整本作废。
+  static String? _takedownNotice(String text) {
+    final trimmed = text.replaceAll(RegExp(r'\s+'), '');
+    if (trimmed.isEmpty || trimmed.length > 240) return null;
+    final mentionsTakedown =
+        trimmed.contains('下架') || trimmed.contains('停止更新');
+    final mentionsCopyright =
+        trimmed.contains('版权') &&
+        (trimmed.contains('不再提供') ||
+            trimmed.contains('无法提供') ||
+            trimmed.contains('停止'));
+    if (!mentionsTakedown && !mentionsCopyright) return null;
+    return '这本书在文库已下架（版权原因），无法下载。';
   }
 
   static String _reason(Object? error) {
@@ -499,6 +640,10 @@ class Wenku8Client {
   Future<List<Wenku8Volume>> catalog(String id) async {
     final category = await _categoryPath(id);
     final html = await _get('/novel/$category/$id/index.htm');
+    // 下架的书目录页会被整页替换成一句说明，章节表是空的。先在这里判一次，
+    // 免得用户排了半天队、跑到第一章才发现整本作废。
+    final notice = _takedownNotice(_plain(html));
+    if (notice != null) throw Wenku8TakedownException(notice);
     final entries = <({bool header, String text, String? id})>[];
     for (final row in RegExp(
       r'<tr[^>]*>(.*?)</tr>',
@@ -619,12 +764,8 @@ class Wenku8Client {
     final text = _plain(body);
     // 文法被版权方下架后，站点对每章都只返回一句「本书版权问题…」；如果不拦，
     // 用户会得到一本 400 多章、每章一句话的假书。
-    if (text.contains('版权') &&
-        (text.contains('文库不再提供') ||
-            text.contains('不再提供该小说') ||
-            text.contains('无法提供'))) {
-      throw Wenku8TakedownException('这本书在文库已下架（版权原因），无法下载。');
-    }
+    final notice = _takedownNotice(text);
+    if (notice != null) throw Wenku8TakedownException(notice);
     final images = <String>[];
     for (final match in _imagePattern.allMatches(body)) {
       final url = match.group(1);
@@ -696,7 +837,9 @@ class Wenku8Client {
         await _waitImageSlot();
         final client = await _http();
         final origin = _origin ?? _origins.first;
-        final request = await client.getUrl(Uri.parse(url));
+        // 图片同样可以走中转：Worker 缓存住插图后，重下同一本书几乎不耗流量。
+        final target = _proxy == null ? url : _proxyUrl(url);
+        final request = await client.getUrl(Uri.parse(target));
         request.headers.set(HttpHeaders.userAgentHeader, userAgent);
         request.headers.set(HttpHeaders.refererHeader, '$origin/');
         request.headers.set(
@@ -1194,4 +1337,12 @@ class _OriginSlot {
   int failures = 0;
   int requests = 0;
   int throttles = 0;
+
+  /// 当前允许的并发数（1–3）。429 立刻降到 1，连续成功再逐步加回来：
+  /// 站点是「一段时间内放行 N 个」的窗口式限流，探到边界就退一步，
+  /// 空等一会儿反而更快。
+  int concurrency = 2;
+
+  /// 连续成功次数，用于把并发与间隔慢慢放回去。
+  int streak = 0;
 }

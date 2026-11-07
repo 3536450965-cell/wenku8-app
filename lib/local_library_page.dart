@@ -334,12 +334,68 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
     if (mounted) setState(() {});
   }
 
+  /// Tapping the strip jumps back to the source page, where progress detail,
+  /// speed and cancel live. Before this the strip told the user something was
+  /// running but gave no way to get back to it.
+  Future<void> _openDownloadsPage() async {
+    await openWenku8Source(context, widget.books, state: widget.state);
+    if (mounted) setState(() {});
+  }
+
+  /// 队列结束但某本书失败时，不要把提示一起收起来。
+  ///
+  /// 之前进度条在 `pumping` 变 false 时直接消失，用户看到的只有「下载被取消了」；
+  /// 这条保留一行原因（多为「已下架」），并给出去文库页看详情的入口。
+  Widget _failureStrip(String message) {
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Material(
+        color: scheme.errorContainer.withValues(alpha: .55),
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: _openDownloadsPage,
+          child: Padding(
+            key: const ValueKey('shelf-download-failure'),
+            padding: const EdgeInsets.fromLTRB(14, 11, 8, 11),
+            child: Row(
+              children: [
+                Icon(Icons.error_outline, size: 17, color: scheme.error),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    message,
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: scheme.onErrorContainer,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                TextButton(
+                  onPressed: _downloads.clearFailure,
+                  child: const Text('知道了'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   /// Downloading used to be visible only on the source page, so leaving it
   /// looked like the download had stopped. The queue lives on the singleton;
   /// this strip is the always-visible view of it.
   Widget _downloadStrip() {
     final downloads = _downloads;
-    if (!downloads.pumping) return const SizedBox.shrink();
+    if (!downloads.pumping) {
+      final failure = downloads.failureMessage;
+      if (failure == null) return const SizedBox.shrink();
+      return _failureStrip(failure);
+    }
     final total = downloads.total;
     final done = downloads.done;
     final scheme = Theme.of(context).colorScheme;
@@ -351,8 +407,12 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
         clipBehavior: Clip.antiAlias,
         child: Padding(
           key: const ValueKey('shelf-download-strip'),
-          padding: const EdgeInsets.fromLTRB(14, 11, 8, 11),
-          child: Column(
+          padding: EdgeInsets.zero,
+          child: InkWell(
+            onTap: _openDownloadsPage,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(14, 11, 8, 11),
+              child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
               Row(
@@ -396,6 +456,8 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
                 ),
               ),
             ],
+          ),
+            ),
           ),
         ),
       ),
