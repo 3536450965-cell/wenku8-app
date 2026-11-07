@@ -25,6 +25,12 @@ class Wenku8Exception implements Exception {
   String toString() => message;
 }
 
+/// 站点把整本书替换成「因版权问题…」的说明页。它必须中断整本下载，否则用户
+/// 会得到一本几百章、每章一句话的假书。
+class Wenku8TakedownException extends Wenku8Exception {
+  Wenku8TakedownException(super.message);
+}
+
 class Wenku8Chapter {
   const Wenku8Chapter({required this.id, required this.title});
 
@@ -149,11 +155,63 @@ class Wenku8Client {
   ];
 
   final Duration timeout;
-  /// 同时抓取的章节数。文库对突发请求敏感，4 条连接配 140ms 间隔在实测里
-  /// 没有触发限流，又比逐章串行快上数倍。
-  static const int _downloadWorkers = 4;
-  static const int _imageWorkers = 3;
-  static const Duration _imageTimeout = Duration(seconds: 12);
+  /// 实测（2026-11-07 复核）：文库的限流是「**较短的窗口内 5 个请求**」——
+   /// 超出后整段窗口都回 429，并带 `retry-after: 8~10`（逐秒递减），
+   /// 间隔 300ms/1200ms 会立刻触顶，间隔 3000ms 也只能连过 5 个。
+   /// 因此按 3 个一窗、窗与窗之间空 9 秒走（≈0.3 请求/秒），撞到 429 就按
+   /// `retry-after` 整段等待；正常时不主动加速，避免把 IP 送进更长的冷却。
+   static const int _downloadWorkers = 1;
+   static const int _imageWorkers = 3;
+   static const Duration _imageTimeout = Duration(seconds: 12);
+   static const int _burst = 3;
+
+   Duration _pace = const Duration(milliseconds: 500);
+  DateTime _nextSlot = DateTime.fromMillisecondsSinceEpoch(0);
+  int _sentInWindow = 0;
+  int _cooldownStrikes = 0;
+
+  // 插图在 img.wenku8.com，与正文页不是同一个限流桶，单独限速即可，
+  // 否则一本插图多的书会被正文窗口拖成半小时。
+  Duration _imagePace = const Duration(milliseconds: 220);
+  DateTime _nextImageSlot = DateTime.fromMillisecondsSinceEpoch(0);
+
+  Future<void> _waitImageSlot() async {
+    final now = DateTime.now();
+    final target = _nextImageSlot.isAfter(now) ? _nextImageSlot : now;
+    _nextImageSlot = target.add(_imagePace);
+    final wait = target.difference(now);
+    if (wait > Duration.zero) await Future<void>.delayed(wait);
+  }
+
+  Future<void> _waitForSlot() async {
+    final now = DateTime.now();
+    var target = _nextSlot.isAfter(now) ? _nextSlot : now;
+    if (_sentInWindow >= _burst) {
+      final cooldown = target.add(const Duration(milliseconds: 9000));
+      if (cooldown.isAfter(target)) target = cooldown;
+      _sentInWindow = 0;
+    }
+    _sentInWindow++;
+    _nextSlot = target.add(_pace);
+    final wait = target.difference(now);
+    if (wait > Duration.zero) await Future<void>.delayed(wait);
+  }
+
+  void _slowDown(int milliseconds) {
+    _cooldownStrikes = (_cooldownStrikes + 1).clamp(1, 3);
+    final base = milliseconds > 0
+        ? milliseconds
+        : 5000 * (1 << (_cooldownStrikes - 1));
+    final wait = base.clamp(4000, 20000);
+    _sentInWindow = 0;
+    final target = DateTime.now().add(Duration(milliseconds: wait));
+    if (target.isAfter(_nextSlot)) _nextSlot = target;
+  }
+
+  void _speedUp() {
+    _cooldownStrikes = 0;
+    _sentInWindow = 0;
+  }
   final Map<String, String> _categories = {};
   HttpClient? _client;
   String? _origin;
@@ -188,9 +246,12 @@ class Wenku8Client {
 
   Future<String> _get(String path) async {
     Object? lastError;
-    for (var attempt = 0; attempt < 5; attempt++) {
+    var attempt = 0;
+    var strikes = 0;
+    while (attempt < 5 && strikes < 5) {
       final origin = _origin ?? _origins.first;
       try {
+        await _waitForSlot();
         final client = await _http();
         final request = await client.getUrl(Uri.parse('$origin$path'));
         // The site sits behind Cloudflare and rejects requests that do not look
@@ -217,11 +278,16 @@ class Wenku8Client {
         if (response.statusCode == 429 || response.statusCode == 503) {
           await response.drain<void>();
           lastError = Wenku8Exception('文库繁忙（${response.statusCode}）');
-          // 限流按 IP 与站点计，等待只会越等越久；直接换镜像继续。
+          // 限流按 IP 与站点计，硬重试只会延长冷却；先把整体节奏放慢，
+          // 再换镜像继续（镜像与主站是不同域名，冷却窗口通常也不同步）。
+          final retryAfter =
+              int.tryParse(
+                response.headers.value(HttpHeaders.retryAfterHeader) ?? '',
+              ) ??
+              0;
+          _slowDown(retryAfter * 1000);
           _rotateOrigin(origin);
-          await Future<void>.delayed(
-            Duration(milliseconds: 400 * (attempt + 1)),
-          );
+          strikes++;
           continue;
         }
         if (response.statusCode != 200) {
@@ -231,6 +297,7 @@ class Wenku8Client {
             .fold<BytesBuilder>(BytesBuilder(copy: false), (b, c) => b..add(c))
             .timeout(timeout);
         _origin = origin;
+        _speedUp();
         return _decode(
           _inflate(
             bytes.takeBytes(),
@@ -243,8 +310,12 @@ class Wenku8Client {
         _client = null;
         if (error is Wenku8Exception) rethrow;
         _rotateOrigin(origin);
-        await Future<void>.delayed(Duration(milliseconds: 300 * (attempt + 1)));
+        attempt++;
+        _slowDown(1500);
       }
+    }
+    if (strikes >= 5) {
+      throw Wenku8Exception('文库正在限流，请稍后再试（$path）');
     }
     throw Wenku8Exception('连接文库失败：${_reason(lastError)}');
   }
@@ -479,6 +550,14 @@ class Wenku8Client {
     final html = await _get('/novel/$categoryPath/$bookId/$chapterId.htm');
     final body = _contentBody(html);
     final text = _plain(body);
+    // 文法被版权方下架后，站点对每章都只返回一句「本书版权问题…」；如果不拦，
+    // 用户会得到一本 400 多章、每章一句话的假书。
+    if (text.contains('版权') &&
+        (text.contains('文库不再提供') ||
+            text.contains('不再提供该小说') ||
+            text.contains('无法提供'))) {
+      throw Wenku8TakedownException('这本书在文库已下架（版权原因），无法下载。');
+    }
     final images = <String>[];
     for (final match in _imagePattern.allMatches(body)) {
       final url = match.group(1);
@@ -544,8 +623,9 @@ class Wenku8Client {
 
   Future<Uint8List> _getImage(String url) async {
     Object? lastError;
-    for (var attempt = 0; attempt < 2; attempt++) {
+    for (var attempt = 0; attempt < 3; attempt++) {
       try {
+        await _waitImageSlot();
         final client = await _http();
         final origin = _origin ?? _origins.first;
         final request = await client.getUrl(Uri.parse(url));
@@ -560,6 +640,14 @@ class Wenku8Client {
         if (response.statusCode != 200) {
           await response.drain<void>();
           lastError = Wenku8Exception('插图返回 ${response.statusCode}');
+          if (response.statusCode == 429 || response.statusCode == 503) {
+            _imagePace = Duration(
+              milliseconds: (_imagePace.inMilliseconds * 2).clamp(220, 3000),
+            );
+            _nextImageSlot = DateTime.now().add(const Duration(seconds: 2));
+            _rotateOrigin(origin);
+            continue;
+          }
           if (attempt == 0) _rotateOrigin(origin);
           await Future<void>.delayed(Duration(milliseconds: 500 * (attempt + 1)));
           continue;
@@ -621,6 +709,9 @@ class Wenku8Client {
       ({String text, List<String> images}) content;
       try {
         content = await _chapterContent(category, book.id, entry.id);
+      } on Wenku8TakedownException {
+        // 整本被下架：继续抓只会攒出一本全是「版权问题」的假书。
+        rethrow;
       } on Wenku8Exception {
         // 单章被限流或缺失不该让整本书失败：等一会儿重试一次，仍不行就跳过，
         // 最后在 Wenku8Download.failed 里如实报告。
@@ -662,9 +753,6 @@ class Wenku8Client {
         final index = cursor++;
         if (index >= all.length) return;
         await fetch(all[index]);
-        if (cursor < all.length) {
-          await Future<void>.delayed(const Duration(milliseconds: 60));
-        }
       }
     }
 

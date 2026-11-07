@@ -590,20 +590,30 @@ class ReaderRichBody {
         paragraphs.add(part);
         continue;
       }
-      final value = jsonDecode(
-        utf8.decode(
-          base64Url.decode(part.substring(prefix.length, part.length - 3)),
-        ),
-      );
-      if (value is! Map ||
-          value['count'] is! int ||
-          value['count'] > paragraphs.length ||
-          value['count'] < 0 ||
+      // Metadata is a convenience layer on top of the prose: a damaged or
+      // stale block must never make a chapter unreadable, so anything that
+      // does not line up is dropped and the plain paragraphs are kept.
+      final Map value;
+      try {
+        final decoded = jsonDecode(
+          utf8.decode(
+            base64Url.decode(part.substring(prefix.length, part.length - 3)),
+          ),
+        );
+        if (decoded is! Map) continue;
+        value = decoded;
+      } on Object {
+        continue;
+      }
+      final count = value['count'];
+      if (count is! int ||
+          count < 0 ||
           value['blocks'] is! Map ||
           value['notes'] is! Map) {
-        throw const FormatException('原书排版数据格式有误');
+        continue;
       }
-      final base = paragraphs.length - (value['count'] as int);
+      if (count > paragraphs.length) continue;
+      final base = paragraphs.length - count;
       revision = value['revision'] is String
           ? value['revision']
           : 'epub-rich-v1';
