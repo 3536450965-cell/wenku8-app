@@ -157,6 +157,7 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
   BookSync? _sync;
   LocalLibraryPreferences? _organization;
   late final _updates = Wenku8Updates(books: widget.books);
+  Wenku8Downloads get _downloads => Wenku8Downloads.instance;
   final _gridViewport = ValueNotifier<BookGridViewport?>(null);
   String? _error;
   bool _importing = false;
@@ -318,6 +319,7 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
     // Import progress, keyboard and viewport changes reuse the ordered books.
     _bookChanges.addListener(_invalidateBooks);
     _updates.addListener(_onUpdates);
+    _downloads.addListener(_onDownloads);
     _load();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _updates.check();
@@ -326,6 +328,65 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
 
   void _onUpdates() {
     if (mounted) setState(() {});
+  }
+
+  void _onDownloads() {
+    if (mounted) setState(() {});
+  }
+
+  /// Downloading used to be visible only on the source page, so leaving it
+  /// looked like the download had stopped. The queue lives on the singleton;
+  /// this strip is the always-visible view of it.
+  Widget _downloadStrip() {
+    final downloads = _downloads;
+    if (!downloads.pumping) return const SizedBox.shrink();
+    final total = downloads.total;
+    final done = downloads.done;
+    final scheme = Theme.of(context).colorScheme;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: Material(
+        color: scheme.surfaceContainerHighest.withValues(alpha: .55),
+        borderRadius: BorderRadius.circular(14),
+        clipBehavior: Clip.antiAlias,
+        child: Padding(
+          key: const ValueKey('shelf-download-strip'),
+          padding: const EdgeInsets.fromLTRB(14, 11, 8, 11),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.downloading, size: 17),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      total > 0
+                          ? '正在下载《${downloads.runningTitle ?? ''}》$done / $total 章'
+                          : '正在准备《${downloads.runningTitle ?? ''}》…',
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: downloads.cancel,
+                    child: const Text('取消'),
+                  ),
+                ],
+              ),
+              if (total > 0) ...[
+                const SizedBox(height: 6),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(3),
+                  child: LinearProgressIndicator(value: done / total),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -819,6 +880,7 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
     _updates
       ..removeListener(_onUpdates)
       ..dispose();
+    _downloads.removeListener(_onDownloads);
     _search.dispose();
     _gridViewport.dispose();
     _searchFocus.dispose();
@@ -983,6 +1045,7 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
                         Column(
                           crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: [
+                            _downloadStrip(),
                             _updateBanner(),
                             if (mixed)
                               _shelfToolbar(organization!, featured.length)

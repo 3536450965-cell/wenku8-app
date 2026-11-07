@@ -155,20 +155,68 @@ class Wenku8Client {
   ];
 
   final Duration timeout;
-  /// 实测（2026-11-07 复核）：文库的限流是「**较短的窗口内 5 个请求**」——
-   /// 超出后整段窗口都回 429，并带 `retry-after: 8~10`（逐秒递减），
-   /// 间隔 300ms/1200ms 会立刻触顶，间隔 3000ms 也只能连过 5 个。
-   /// 因此按 3 个一窗、窗与窗之间空 9 秒走（≈0.3 请求/秒），撞到 429 就按
-   /// `retry-after` 整段等待；正常时不主动加速，避免把 IP 送进更长的冷却。
-   static const int _downloadWorkers = 1;
-   static const int _imageWorkers = 3;
-   static const Duration _imageTimeout = Duration(seconds: 12);
-   static const int _burst = 3;
+  static const int _downloadWorkers = 2;
+  static const int _imageWorkers = 3;
+  static const Duration _imageTimeout = Duration(seconds: 12);
 
-   Duration _pace = const Duration(milliseconds: 500);
-  DateTime _nextSlot = DateTime.fromMillisecondsSinceEpoch(0);
-  int _sentInWindow = 0;
+  /// 站点按 **每个域名** 分窗口限流：同一个域名大约每 1.8–2.5 秒才放行一个
+  /// 章节请求，超出就整段 429（实测 `retry-after` 8~10 秒）。但 `.cc` 与
+  /// `.net` 是两个独立窗口——交叉着取，单个域名仍然慢，整体却能快接近一倍。
+  /// 所以节奏按域名记，取「最早空出来的那个域名」发请求。
+  static const Duration _paceFloor = Duration(milliseconds: 2000);
+  static const Duration _paceCeiling = Duration(milliseconds: 9000);
+
+  Duration _pace = _paceFloor;
+  final Map<String, DateTime> _ready = <String, DateTime>{};
   int _cooldownStrikes = 0;
+  int _successStreak = 0;
+
+  /// 选一个域名并占好它的时间槽；返回真正可以发请求的 origin。
+  Future<String> _claimSlot() async {
+    final now = DateTime.now();
+    var origin = _origins.first;
+    var target = now;
+    var first = true;
+    for (final candidate in _origins) {
+      final ready = _ready[candidate] ?? now;
+      final at = ready.isAfter(now) ? ready : now;
+      if (first || at.isBefore(target)) {
+        first = false;
+        origin = candidate;
+        target = at;
+      }
+    }
+    _ready[origin] = target.add(_pace);
+    final wait = target.difference(now);
+    if (wait > Duration.zero) await Future<void>.delayed(wait);
+    return origin;
+  }
+
+  /// 429/503 之后调用：把这个域名整段冷却（按 `retry-after`），并把全局节奏
+  /// 放大一档。冷却只作用于单个域名，另一个域名照常可以继续。
+  void _slowDown(String origin, int milliseconds) {
+    _successStreak = 0;
+    _cooldownStrikes = (_cooldownStrikes + 1).clamp(1, 3);
+    final backoff = milliseconds > 0
+        ? milliseconds
+        : 5000 * (1 << (_cooldownStrikes - 1));
+    final wait = backoff.clamp(4000, 20000);
+    final until = DateTime.now().add(Duration(milliseconds: wait));
+    final known = _ready[origin];
+    _ready[origin] = known == null || known.isBefore(until) ? until : known;
+    final slower = _pace + const Duration(milliseconds: 1200);
+    _pace = slower > _paceCeiling ? _paceCeiling : slower;
+  }
+
+  /// 连续成功时一点点把节奏提回来，避免被限流一次就长期慢跑。
+  void _speedUp() {
+    _cooldownStrikes = 0;
+    _successStreak++;
+    if (_successStreak < 15) return;
+    _successStreak = 0;
+    final faster = _pace - const Duration(milliseconds: 200);
+    _pace = faster < _paceFloor ? _paceFloor : faster;
+  }
 
   // 插图在 img.wenku8.com，与正文页不是同一个限流桶，单独限速即可，
   // 否则一本插图多的书会被正文窗口拖成半小时。
@@ -183,35 +231,6 @@ class Wenku8Client {
     if (wait > Duration.zero) await Future<void>.delayed(wait);
   }
 
-  Future<void> _waitForSlot() async {
-    final now = DateTime.now();
-    var target = _nextSlot.isAfter(now) ? _nextSlot : now;
-    if (_sentInWindow >= _burst) {
-      final cooldown = target.add(const Duration(milliseconds: 9000));
-      if (cooldown.isAfter(target)) target = cooldown;
-      _sentInWindow = 0;
-    }
-    _sentInWindow++;
-    _nextSlot = target.add(_pace);
-    final wait = target.difference(now);
-    if (wait > Duration.zero) await Future<void>.delayed(wait);
-  }
-
-  void _slowDown(int milliseconds) {
-    _cooldownStrikes = (_cooldownStrikes + 1).clamp(1, 3);
-    final base = milliseconds > 0
-        ? milliseconds
-        : 5000 * (1 << (_cooldownStrikes - 1));
-    final wait = base.clamp(4000, 20000);
-    _sentInWindow = 0;
-    final target = DateTime.now().add(Duration(milliseconds: wait));
-    if (target.isAfter(_nextSlot)) _nextSlot = target;
-  }
-
-  void _speedUp() {
-    _cooldownStrikes = 0;
-    _sentInWindow = 0;
-  }
   final Map<String, String> _categories = {};
   HttpClient? _client;
   String? _origin;
@@ -249,9 +268,12 @@ class Wenku8Client {
     var attempt = 0;
     var strikes = 0;
     while (attempt < 5 && strikes < 5) {
-      final origin = _origin ?? _origins.first;
+      var origin = _origin ?? _origins.first;
       try {
-        await _waitForSlot();
+        // 每个域名有独立的限流窗口，所以「排队」要按域名排：拿到时间槽的
+        // 那个域名才是这次真正要用的（两个镜像会自然交替）。
+        origin = await _claimSlot();
+        _origin = origin;
         final client = await _http();
         final request = await client.getUrl(Uri.parse('$origin$path'));
         // The site sits behind Cloudflare and rejects requests that do not look
@@ -285,8 +307,7 @@ class Wenku8Client {
                 response.headers.value(HttpHeaders.retryAfterHeader) ?? '',
               ) ??
               0;
-          _slowDown(retryAfter * 1000);
-          _rotateOrigin(origin);
+          _slowDown(origin, retryAfter * 1000);
           strikes++;
           continue;
         }
@@ -311,7 +332,7 @@ class Wenku8Client {
         if (error is Wenku8Exception) rethrow;
         _rotateOrigin(origin);
         attempt++;
-        _slowDown(1500);
+        _slowDown(origin, 1500);
       }
     }
     if (strikes >= 5) {

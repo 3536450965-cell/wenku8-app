@@ -34,6 +34,7 @@ import 'updates/ios_update_platform.dart';
 import 'updates/harmony_update_platform.dart';
 import 'updates/update_page.dart';
 import 'wenku_account.dart';
+import 'wenku8_page.dart' show Wenku8Downloads;
 import 'wenku_features.dart';
 import 'wenku_shelf_sync.dart';
 import 'publication_catalog.dart';
@@ -633,6 +634,11 @@ class _NovelAppState extends State<NovelApp> with WidgetsBindingObserver {
     }
     if (lifecycle == AppLifecycleState.resumed) _queueStartupReading();
     if (lifecycle == AppLifecycleState.resumed) _queueReadingWidgetRoute();
+    // iOS suspends timers in the background; a download queue that was mid-run
+    // would silently sit still until something pokes it again.
+    if (lifecycle == AppLifecycleState.resumed) {
+      Wenku8Downloads.instance.resumeIfNeeded();
+    }
     // The reader settles its final eligible interval in this same lifecycle
     // dispatch. Publish on the next event turn, after its ledger microtasks.
     if (lifecycle == AppLifecycleState.resumed ||

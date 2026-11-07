@@ -149,7 +149,8 @@ class _Wenku8PageState extends State<Wenku8Page> {
     super.initState();
     _downloads
       ..attach(widget.books, widget.state)
-      ..addListener(_onDownloads);
+      ..addListener(_onDownloads)
+      ..resumeIfNeeded();
     final initial = widget.initialQuery?.trim();
     if (initial != null && initial.isNotEmpty) {
       _input.text = initial;
@@ -1082,6 +1083,14 @@ class Wenku8Downloads extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// iOS freezes timers while the app is in the background, and a suspended
+  /// pump looks exactly like a stopped one. Call this whenever the app comes
+  /// back or a page re-attaches: no-op unless there is unfinished work.
+  void resumeIfNeeded() {
+    if (pumping || queue.isEmpty) return;
+    unawaited(_pump());
+  }
+
   Future<void> _pump() async {
     if (pumping) return;
     pumping = true;
@@ -1093,7 +1102,15 @@ class Wenku8Downloads extends ChangeNotifier {
           break;
         }
         final job = queue.first;
-        await _run(job);
+        try {
+          await _run(job);
+        } catch (error) {
+          // One broken book (catalog blocked, network dropped, epub refused)
+          // used to escape this loop and leave the rest of the queue frozen:
+          // the bar kept rendering while nothing advanced. Report and move on.
+          job.status = '$error';
+          failedBooks[job.book.id] = (book: job.book, count: 0);
+        }
         queue.remove(job);
         notifyListeners();
       }
