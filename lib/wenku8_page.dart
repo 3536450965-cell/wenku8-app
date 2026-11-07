@@ -787,6 +787,16 @@ class _Wenku8PageState extends State<Wenku8Page> {
                   : '正在准备《${_runningTitle ?? ''}》…',
               style: muted,
             ),
+            Text(
+              [
+                if (_downloads.speedLabel != null) _downloads.speedLabel!,
+                _downloads.routeLabel,
+              ].join(' · '),
+              style: muted.copyWith(
+                fontSize: 11,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
             if (_queue.length > 1) Text('队列里还有 ${_queue.length - 1} 本', style: muted),
             Align(
               alignment: Alignment.centerRight,
@@ -1063,6 +1073,42 @@ class Wenku8Downloads extends ChangeNotifier {
   int total = 0;
   String? runningTitle;
 
+  /// 采样点，用来算「每秒几章」这种用户能直接对照的数字。
+  DateTime? _sampleAt;
+  int _sampleDone = 0;
+  double _chaptersPerMinute = 0;
+
+  /// 最近一分钟的下载速率，例如 `12.3 章/分`；还没测出来时返回 null。
+  String? get speedLabel {
+    if (_chaptersPerMinute <= 0) return null;
+    return '${_chaptersPerMinute.toStringAsFixed(1)} 章/分';
+  }
+
+  /// 当前走的镜像与本次触发限流的次数，出问题时报这个数字就能定位。
+  String get routeLabel {
+    final throttles = _client.throttleCount;
+    final origin = _client.activeOrigin;
+    return throttles == 0 ? origin : '$origin · 限流 $throttles 次';
+  }
+
+  void _sample(int value) {
+    final now = DateTime.now();
+    final at = _sampleAt;
+    if (at == null) {
+      _sampleAt = now;
+      _sampleDone = value;
+      return;
+    }
+    final seconds = now.difference(at).inMilliseconds / 1000;
+    if (seconds < 5) return;
+    final gained = value - _sampleDone;
+    if (gained > 0) {
+      _chaptersPerMinute = gained / seconds * 60;
+    }
+    _sampleAt = now;
+    _sampleDone = value;
+  }
+
   void attach(LocalBookStore store, LibraryState? libraryState) {
     books = store;
     state = libraryState;
@@ -1259,6 +1305,9 @@ class Wenku8Downloads extends ChangeNotifier {
     done = 0;
     total = job.chapters;
     cancelRequested = false;
+    _sampleAt = null;
+    _sampleDone = 0;
+    _chaptersPerMinute = 0;
     notifyListeners();
     try {
       final download = await _client.download(
@@ -1268,6 +1317,7 @@ class Wenku8Downloads extends ChangeNotifier {
         onProgress: (value, maximum) {
           done = value;
           total = maximum;
+          _sample(value);
           notifyListeners();
         },
       );

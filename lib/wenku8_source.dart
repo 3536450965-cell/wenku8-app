@@ -155,67 +155,91 @@ class Wenku8Client {
   ];
 
   final Duration timeout;
-  static const int _downloadWorkers = 2;
+  static const int _downloadWorkers = 3;
   static const int _imageWorkers = 3;
   static const Duration _imageTimeout = Duration(seconds: 12);
 
-  /// 站点按 **每个域名** 分窗口限流：同一个域名大约每 1.8–2.5 秒才放行一个
-  /// 章节请求，超出就整段 429（实测 `retry-after` 8~10 秒）。但 `.cc` 与
-  /// `.net` 是两个独立窗口——交叉着取，单个域名仍然慢，整体却能快接近一倍。
-  /// 所以节奏按域名记，取「最早空出来的那个域名」发请求。
-  static const Duration _paceFloor = Duration(milliseconds: 2000);
-  static const Duration _paceCeiling = Duration(milliseconds: 9000);
+  /// 建连单独用更短的超时：某个镜像在某些网络里根本连不上，等满 20 秒再
+  /// 放弃等于把整本书拖死，6 秒内连不上就当这个域名暂时不可用。
+  static const Duration _connectTimeout = Duration(seconds: 6);
 
-  Duration _pace = _paceFloor;
-  final Map<String, DateTime> _ready = <String, DateTime>{};
-  int _cooldownStrikes = 0;
-  int _successStreak = 0;
+  /// 站点按 **每个域名** 分窗口限流：同一个域名大约每 2 秒才放行一个章节
+  /// 请求，超出就整段 429（`retry-after` 8~10 秒）。`.cc` 与 `.net` 是两套
+  /// 独立配额，所以节奏按域名各记一份；同时记每个域名的往返耗时与连续失败，
+  /// 慢的、连不上的自动降权——少这一步，一半请求会死在超时上。
+  static const Duration _gapFloor = Duration(milliseconds: 900);
+  static const Duration _gapCeiling = Duration(milliseconds: 12000);
+  static const Duration _quarantine = Duration(seconds: 40);
 
-  /// 选一个域名并占好它的时间槽；返回真正可以发请求的 origin。
-  Future<String> _claimSlot() async {
+  final Map<String, _OriginSlot> _slots = {
+    for (final origin in _origins) origin: _OriginSlot(origin),
+  };
+
+  _OriginSlot? _current;
+
+  /// 当前实际在用的域名（界面显示用）。
+  String get activeOrigin =>
+      _current?.origin.replaceFirst('https://www.', '') ?? '—';
+
+  /// 本次会话触发限流的次数（界面显示用）。
+  int get throttleCount =>
+      _slots.values.fold<int>(0, (sum, slot) => sum + slot.throttles);
+
+  /// 选一个最早空出来的域名，占好它的时间槽后再发请求。
+  Future<_OriginSlot> _claimSlot() async {
     final now = DateTime.now();
-    var origin = _origins.first;
-    var target = now;
-    var first = true;
-    for (final candidate in _origins) {
-      final ready = _ready[candidate] ?? now;
-      final at = ready.isAfter(now) ? ready : now;
-      if (first || at.isBefore(target)) {
-        first = false;
-        origin = candidate;
-        target = at;
-      }
+    _OriginSlot? pick;
+    for (final origin in _origins) {
+      final slot = _slots[origin]!;
+      if (pick == null || slot.next.isBefore(pick.next)) pick = slot;
     }
-    _ready[origin] = target.add(_pace);
+    final slot = pick!;
+    final target = slot.next.isAfter(now) ? slot.next : now;
+    slot.next = target.add(slot.gap);
     final wait = target.difference(now);
     if (wait > Duration.zero) await Future<void>.delayed(wait);
-    return origin;
+    _current = slot;
+    return slot;
   }
 
-  /// 429/503 之后调用：把这个域名整段冷却（按 `retry-after`），并把全局节奏
-  /// 放大一档。冷却只作用于单个域名，另一个域名照常可以继续。
-  void _slowDown(String origin, int milliseconds) {
-    _successStreak = 0;
-    _cooldownStrikes = (_cooldownStrikes + 1).clamp(1, 3);
-    final backoff = milliseconds > 0
-        ? milliseconds
-        : 5000 * (1 << (_cooldownStrikes - 1));
-    final wait = backoff.clamp(4000, 20000);
-    final until = DateTime.now().add(Duration(milliseconds: wait));
-    final known = _ready[origin];
-    _ready[origin] = known == null || known.isBefore(until) ? until : known;
-    final slower = _pace + const Duration(milliseconds: 1200);
-    _pace = slower > _paceCeiling ? _paceCeiling : slower;
+  /// 一次成功：清失败计数，节奏按倍率往回收（快降快升，不会卡在慢值上）。
+  void _praise(_OriginSlot slot, Duration elapsed) {
+    slot.requests++;
+    slot.failures = 0;
+    slot.blockedUntil = null;
+    final ms = elapsed.inMilliseconds.toDouble();
+    slot.ema = slot.ema == 0 ? ms : slot.ema * 0.7 + ms * 0.3;
+    final faster = Duration(
+      milliseconds: (slot.gap.inMilliseconds * 0.82).round(),
+    );
+    slot.gap = faster < _gapFloor ? _gapFloor : faster;
   }
 
-  /// 连续成功时一点点把节奏提回来，避免被限流一次就长期慢跑。
-  void _speedUp() {
-    _cooldownStrikes = 0;
-    _successStreak++;
-    if (_successStreak < 15) return;
-    _successStreak = 0;
-    final faster = _pace - const Duration(milliseconds: 200);
-    _pace = faster < _paceFloor ? _paceFloor : faster;
+  /// 429：只惩罚这个域名（按 `retry-after` 整段冷却 + 间隔翻倍），不动别的域名。
+  void _throttle(_OriginSlot slot, int milliseconds) {
+    slot.throttles++;
+    final until = DateTime.now().add(
+      Duration(milliseconds: milliseconds.clamp(3000, 20000)),
+    );
+    final doubled = Duration(milliseconds: slot.gap.inMilliseconds * 2);
+    slot.gap = doubled > _gapCeiling ? _gapCeiling : doubled;
+    slot.blockedUntil = until;
+    if (slot.next.isBefore(until)) slot.next = until;
+  }
+
+  /// 网络错误/超时：连续失败就先把这个域名隔离一段时间，别继续往死域名上撞。
+  void _fail(_OriginSlot slot) {
+    slot.failures++;
+    final slower = Duration(
+      milliseconds: (slot.gap.inMilliseconds * 1.6).round(),
+    );
+    slot.gap = slower > _gapCeiling ? _gapCeiling : slower;
+    if (slot.failures >= 2) {
+      final until = DateTime.now().add(_quarantine);
+      slot.blockedUntil = until;
+      if (slot.next.isBefore(until)) slot.next = until;
+      slot.failures = 0;
+    }
   }
 
   // 插图在 img.wenku8.com，与正文页不是同一个限流桶，单独限速即可，
@@ -256,7 +280,7 @@ class Wenku8Client {
     final existing = _client;
     if (existing != null) return existing;
     final client = HttpClient()
-      ..connectionTimeout = timeout
+      ..connectionTimeout = _connectTimeout
       ..autoUncompress = false
       ..userAgent = userAgent;
     _client = client;
@@ -268,12 +292,12 @@ class Wenku8Client {
     var attempt = 0;
     var strikes = 0;
     while (attempt < 5 && strikes < 5) {
-      var origin = _origin ?? _origins.first;
+      _OriginSlot? slot;
       try {
         // 每个域名有独立的限流窗口，所以「排队」要按域名排：拿到时间槽的
-        // 那个域名才是这次真正要用的（两个镜像会自然交替）。
-        origin = await _claimSlot();
-        _origin = origin;
+        // 那个域名才是这次真正要用的。
+        slot = await _claimSlot();
+        final origin = slot.origin;
         final client = await _http();
         final request = await client.getUrl(Uri.parse('$origin$path'));
         // The site sits behind Cloudflare and rejects requests that do not look
@@ -296,18 +320,17 @@ class Wenku8Client {
         request.headers.set('sec-fetch-mode', 'navigate');
         request.headers.set('sec-fetch-site', 'same-origin');
         request.headers.set('sec-fetch-user', '?1');
+        final startedAt = DateTime.now();
         final response = await request.close().timeout(timeout);
         if (response.statusCode == 429 || response.statusCode == 503) {
           await response.drain<void>();
           lastError = Wenku8Exception('文库繁忙（${response.statusCode}）');
-          // 限流按 IP 与站点计，硬重试只会延长冷却；先把整体节奏放慢，
-          // 再换镜像继续（镜像与主站是不同域名，冷却窗口通常也不同步）。
           final retryAfter =
               int.tryParse(
                 response.headers.value(HttpHeaders.retryAfterHeader) ?? '',
               ) ??
               0;
-          _slowDown(origin, retryAfter * 1000);
+          if (slot != null) _throttle(slot, retryAfter * 1000);
           strikes++;
           continue;
         }
@@ -318,7 +341,7 @@ class Wenku8Client {
             .fold<BytesBuilder>(BytesBuilder(copy: false), (b, c) => b..add(c))
             .timeout(timeout);
         _origin = origin;
-        _speedUp();
+        if (slot != null) _praise(slot, DateTime.now().difference(startedAt));
         return _decode(
           _inflate(
             bytes.takeBytes(),
@@ -330,9 +353,8 @@ class Wenku8Client {
         _client?.close(force: true);
         _client = null;
         if (error is Wenku8Exception) rethrow;
-        _rotateOrigin(origin);
         attempt++;
-        _slowDown(origin, 1500);
+        if (slot != null) _fail(slot);
       }
     }
     if (strikes >= 5) {
@@ -1102,3 +1124,30 @@ $body
 final RegExp _illustrationPlaceholder = RegExp(
   r'^[（(【\[]\s*插\s*[图圖]\s*0*(\d{1,3})\s*[)）】\]]$',
 );
+
+/// 每个镜像域名各自的限流节奏与健康度。
+///
+/// 站点给每个域名一套独立配额：被限流时只有这个域名进入冷却，另一个照常
+/// 可用；连不上（超时/握手失败）时累计两次就把这个域名隔离一段时间，
+/// 免得继续把请求丢进会挂满一个超时的分支。
+class _OriginSlot {
+  _OriginSlot(this.origin);
+
+  final String origin;
+
+  /// 两次请求之间的最小间隔：成功就按倍率往回收，429 就翻倍。
+  Duration gap = const Duration(milliseconds: 900);
+
+  /// 下一次允许发请求的时间。
+  DateTime next = DateTime.fromMillisecondsSinceEpoch(0);
+
+  /// 冷却截止时间（429 或连续失败时设置）。
+  DateTime? blockedUntil;
+
+  /// 往返耗时指数平均（毫秒），目前只用于诊断显示。
+  double ema = 0;
+
+  int failures = 0;
+  int requests = 0;
+  int throttles = 0;
+}

@@ -382,6 +382,17 @@ class _LocalLibraryPageState extends State<LocalLibraryPage>
                   child: LinearProgressIndicator(value: done / total),
                 ),
               ],
+              Text(
+                [
+                  if (downloads.speedLabel != null) downloads.speedLabel!,
+                  downloads.routeLabel,
+                ].join(' · '),
+                style: TextStyle(
+                  fontSize: 11,
+                  color: scheme.onSurfaceVariant,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
             ],
           ),
         ),
